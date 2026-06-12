@@ -1,0 +1,63 @@
+name: Release (Windows)
+
+# Dispara quando você cria/empurra uma tag começando com "v" (ex: v0.1.0).
+# Também pode ser rodado manualmente pela aba Actions (workflow_dispatch).
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag para criar o release (ex: v0.1.0)"
+        required: true
+        default: "v0.0.0"
+
+# Necessário para o tauri-action criar o GitHub Release e subir os instaladores.
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Instalar pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+          run_install: false
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Instalar toolchain Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache do Rust (acelera builds futuros)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Instalar dependências do frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: Build do Tauri + criar Release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # Usa a tag que disparou o workflow (ou a informada manualmente).
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || github.event.inputs.tag }}
+          releaseName: "Application __VERSION__"
+          releaseBody: "Instaladores para Windows. Baixe o arquivo .exe (NSIS) ou .msi abaixo."
+          releaseDraft: false
+          prerelease: false
+          # Gera os dois instaladores de Windows (NSIS .exe e MSI).
+          args: --target x86_64-pc-windows-msvc
