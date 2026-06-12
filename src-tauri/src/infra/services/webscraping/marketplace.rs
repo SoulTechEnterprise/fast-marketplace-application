@@ -6,7 +6,15 @@ use chromiumoxide::{
 };
 use futures::StreamExt;
 use std::path::PathBuf;
-use tokio::time::{Duration, sleep};
+use tokio::sync::{Mutex, MutexGuard};
+use tokio::time::{Duration, sleep, timeout};
+
+/// Tempo máximo para o Chrome iniciar. Em máquinas lentas (HD mecânico,
+/// antivírus escaneando o binário) o launch pode demorar bastante.
+const BROWSER_LAUNCH_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Tempo máximo para o download automático do Chromium (~150 MB).
+const CHROMIUM_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 use crate::infra::logger;
 
@@ -99,6 +107,10 @@ fn profile_dir(client_id: &str) -> PathBuf {
 // Detecção robusta do executável Chrome/Chromium
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Cache do executável encontrado, para não repetir a busca (e principalmente
+/// não repetir `where`/`which` nem o fetcher) a cada operação.
+static CHROME_PATH_CACHE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
 /// Busca um executável Chrome/Chromium disponível no sistema, em ordem de prioridade:
 /// 1. Chromium embutido na pasta `chrome-win` ao lado do executável
 /// 2. Variável de ambiente CHROME_PATH
@@ -106,6 +118,25 @@ fn profile_dir(client_id: &str) -> PathBuf {
 /// 4. Busca no PATH via `which` / `where`
 /// 5. Download automático via chromiumoxide fetcher (requer internet)
 async fn find_chrome_executable() -> Option<PathBuf> {
+    // ── 0. Cache (validando que o arquivo ainda existe) ────────────────────
+    if let Ok(cache) = CHROME_PATH_CACHE.lock() {
+        if let Some(p) = cache.as_ref() {
+            if p.exists() {
+                return Some(p.clone());
+            }
+        }
+    }
+
+    let found = find_chrome_executable_uncached().await;
+
+    if let (Some(p), Ok(mut cache)) = (found.as_ref(), CHROME_PATH_CACHE.lock()) {
+        *cache = Some(p.clone());
+    }
+
+    found
+}
+
+async fn find_chrome_executable_uncached() -> Option<PathBuf> {
     // ── 1. Chromium embutido (chrome-win/ ao lado do .exe) ─────────────────
     if let Ok(exe) = std::env::current_exe() {
         if let Some(exe_dir) = exe.parent() {
@@ -189,7 +220,18 @@ async fn find_chrome_executable() -> Option<PathBuf> {
     );
 
     for name in &browser_names {
-        if let Ok(output) = std::process::Command::new(finder_cmd).arg(name).output() {
+        let mut cmd = std::process::Command::new(finder_cmd);
+        cmd.arg(name);
+
+        // No Windows (subsystem "windows"), processos filhos de console abrem
+        // uma janela de terminal que pisca na tela. CREATE_NO_WINDOW evita isso.
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+
+        if let Ok(output) = cmd.output() {
             if output.status.success() {
                 let raw = String::from_utf8_lossy(&output.stdout);
                 let first_line = raw.lines().next().unwrap_or("").trim().to_string();
@@ -212,16 +254,21 @@ async fn find_chrome_executable() -> Option<PathBuf> {
 
         match BrowserFetcherOptions::default() {
             Ok(options) => {
-                match BrowserFetcher::new(options).fetch().await {
-                    Ok(info) => {
+                // Timeout: em conexões muito lentas/instáveis o download pode
+                // ficar pendurado para sempre e travar a requisição inteira.
+                match timeout(CHROMIUM_DOWNLOAD_TIMEOUT, BrowserFetcher::new(options).fetch()).await {
+                    Ok(Ok(info)) => {
                         logger::info(&format!(
                             "Chromium baixado com sucesso: {}",
                             info.executable_path.display()
                         ));
                         return Some(info.executable_path);
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         logger::warn(&format!("Falha ao baixar Chromium automaticamente: {}", e));
+                    }
+                    Err(_) => {
+                        logger::warn("Download do Chromium excedeu o tempo limite (conexão lenta?).");
                     }
                 }
             }
@@ -617,11 +664,31 @@ fn chrome_not_found_error() -> DomainError {
     )
 }
 
-pub struct FacebookMarketplaceService {}
+pub struct FacebookMarketplaceService {
+    /// Serializa as operações de browser. Sem isso, duas requisições
+    /// simultâneas abrem dois Chromes no mesmo perfil (corrompendo a sessão
+    /// via SingletonLock) e sobrecarregam máquinas fracas.
+    operation_lock: Mutex<()>,
+}
 
 impl FacebookMarketplaceService {
     pub fn new() -> Self {
-        Self {}
+        Self {
+            operation_lock: Mutex::new(()),
+        }
+    }
+
+    /// Tenta adquirir o lock de operação. Se outra operação estiver em
+    /// andamento, falha imediatamente com uma mensagem clara em vez de
+    /// enfileirar (o cliente HTTP estouraria timeout esperando).
+    fn acquire_operation_lock(&self) -> Result<MutexGuard<'_, ()>, DomainError> {
+        self.operation_lock.try_lock().map_err(|_| {
+            DomainError::AutomationError(
+                "Já existe uma operação em andamento no navegador. \
+                Aguarde ela terminar antes de iniciar outra."
+                    .to_string(),
+            )
+        })
     }
 
     async fn launch_browser(client_id: &str) -> Result<Browser, DomainError> {
@@ -633,14 +700,11 @@ impl FacebookMarketplaceService {
             "--disable-infobars",
             "--disable-notifications",
             "--disable-blink-features=AutomationControlled",
-            "--excludeSwitches=enable-automation",
-            "--useAutomationExtension=false",
             "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
             "--no-restore-session-state",
             "--restore-last-session=false",
             "--disable-session-crashed-bubble",
             "--disable-background-mode",
-            "--disable-automation",
             "--password-store=basic",
             "--use-mock-keychain",
             "--lang=pt-BR",
@@ -686,8 +750,10 @@ impl FacebookMarketplaceService {
                     continue;
                 }
                 Ok(config) => {
-                    match Browser::launch(config).await {
-                        Ok((browser, mut handler)) => {
+                    // Timeout: antivírus escaneando o binário ou disco lento
+                    // podem deixar o launch pendurado indefinidamente.
+                    match timeout(BROWSER_LAUNCH_TIMEOUT, Browser::launch(config)).await {
+                        Ok(Ok((browser, mut handler))) => {
                             tokio::task::spawn(async move {
                                 while let Some(h) = handler.next().await {
                                     if h.is_err() { break; }
@@ -696,13 +762,20 @@ impl FacebookMarketplaceService {
                             logger::info(&format!("Browser iniciado (tentativa {})", attempt + 1));
                             return Ok(browser);
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             logger::warn(&format!(
                                 "Tentativa {} falhou ao iniciar o browser: {:?}",
                                 attempt + 1, e
                             ));
                             // Aguarda um pouco antes de tentar novamente
                             sleep(Duration::from_millis(500)).await;
+                        }
+                        Err(_) => {
+                            logger::warn(&format!(
+                                "Tentativa {}: browser não iniciou em {}s (timeout)",
+                                attempt + 1,
+                                BROWSER_LAUNCH_TIMEOUT.as_secs()
+                            ));
                         }
                     }
                 }
@@ -734,8 +807,8 @@ impl FacebookMarketplaceService {
                     continue;
                 }
                 Ok(config) => {
-                    match Browser::launch(config).await {
-                        Ok((browser, mut handler)) => {
+                    match timeout(BROWSER_LAUNCH_TIMEOUT, Browser::launch(config)).await {
+                        Ok(Ok((browser, mut handler))) => {
                             tokio::task::spawn(async move {
                                 while let Some(h) = handler.next().await {
                                     if h.is_err() { break; }
@@ -744,12 +817,19 @@ impl FacebookMarketplaceService {
                             logger::info(&format!("Browser headless iniciado (tentativa {})", attempt + 1));
                             return Ok(browser);
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             logger::warn(&format!(
                                 "Tentativa headless {} falhou: {:?}",
                                 attempt + 1, e
                             ));
                             sleep(Duration::from_millis(500)).await;
+                        }
+                        Err(_) => {
+                            logger::warn(&format!(
+                                "Tentativa headless {}: browser não iniciou em {}s (timeout)",
+                                attempt + 1,
+                                BROWSER_LAUNCH_TIMEOUT.as_secs()
+                            ));
                         }
                     }
                 }
@@ -822,6 +902,7 @@ const ANTI_DETECTION_JS: &str = r#"
 impl WebscrapingMarketplaceService for FacebookMarketplaceService {
     async fn add_property(&self, entity: Property, client_id: String) -> Result<(), DomainError> {
         sanitize_client_id(&client_id)?;
+        let _op = self.acquire_operation_lock()?;
 
         const XPATH_MODEL_DROPDOWN: &str = "//label[@role='combobox'][contains(., 'venda ou locação') or contains(., 'Home for sale or rent') or contains(., 'Home for sale') or contains(., 'Property for rent') or contains(., 'Property for sale') or contains(., 'Listing type') or contains(., 'Alquiler')]";
         const XPATH_CATEGORY_DROPDOWN: &str = "//label[@role='combobox'][contains(., 'Tipo de imóvel') or contains(., 'Home type') or contains(., 'Property type') or contains(., 'Tipo de propiedad')]";
@@ -943,6 +1024,7 @@ impl WebscrapingMarketplaceService for FacebookMarketplaceService {
 
     async fn add_vehicle(&self, entity: Vehicle, client_id: String) -> Result<(), DomainError> {
         sanitize_client_id(&client_id)?;
+        let _op = self.acquire_operation_lock()?;
 
         const XPATH_TYPE_DROPDOWN: &str = "//label[@role='combobox'][contains(., 'Tipo de veículo') or contains(., 'Vehicle type') or contains(., 'Type') or contains(., 'Tipo de vehículo')]";
         const XPATH_YEAR_DROPDOWN: &str = "//label[@role='combobox'][contains(., 'Ano') or contains(., 'Year') or contains(., 'Año')]";
@@ -1092,6 +1174,7 @@ impl WebscrapingMarketplaceService for FacebookMarketplaceService {
 
     async fn signin(&self, client_id: String) -> Result<(), DomainError> {
         sanitize_client_id(&client_id)?;
+        let _op = self.acquire_operation_lock()?;
         let browser = Self::launch_browser(client_id.as_str()).await?;
         let guard = BrowserGuard::new(browser);
         let page = Self::get_or_create_page(
@@ -1134,6 +1217,7 @@ impl WebscrapingMarketplaceService for FacebookMarketplaceService {
 
     async fn signout(&self, client_id: String) -> Result<(), DomainError> {
         sanitize_client_id(&client_id)?;
+        let _op = self.acquire_operation_lock()?;
         let browser = Self::launch_browser_headless(client_id.as_str()).await?;
         let guard = BrowserGuard::new(browser);
         let page = Self::get_or_create_page(
@@ -1211,6 +1295,7 @@ impl WebscrapingMarketplaceService for FacebookMarketplaceService {
 
     async fn get_account(&self, client_id: String) -> Result<bool, DomainError> {
         sanitize_client_id(&client_id)?;
+        let _op = self.acquire_operation_lock()?;
         let browser = Self::launch_browser_headless(client_id.as_str()).await?;
         let guard = BrowserGuard::new(browser);
 

@@ -45,6 +45,19 @@ const ALLOWED_ORIGINS: [&str; 7] = [
 
 // ─── Servidor HTTP (Axum) ────────────────────────────────────────────────────
 
+/// Verifica se já existe outra instância desta aplicação respondendo na porta.
+/// Evita que uma segunda instância fique rodando sem servidor (porta ocupada).
+async fn another_instance_is_running() -> bool {
+    let url = format!("http://{}:{}/healthz", SERVER_HOST, SERVER_PORT);
+    match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+    {
+        Ok(client) => matches!(client.get(&url).send().await, Ok(r) if r.status().is_success()),
+        Err(_) => false,
+    }
+}
+
 async fn start_http_server() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     eprintln!("[HTTP] Inicializando dependências...");
 
@@ -96,11 +109,58 @@ async fn start_http_server() -> Result<(), Box<dyn std::error::Error + Send + Sy
 
     eprintln!("[HTTP] Criando socket em {addr}...");
 
-    let socket = tokio::net::TcpSocket::new_v4()?;
-    let _ = socket.set_reuseaddr(true);
-    socket.bind(addr)?;
+    // Tenta abrir a porta com algumas tentativas: em máquinas lentas, ou após
+    // um restart rápido, a porta pode ainda estar em TIME_WAIT ou ocupada por
+    // uma instância anterior que está encerrando.
+    let mut listener = None;
+    let mut last_err: Option<std::io::Error> = None;
 
-    let listener = socket.listen(1024)?;
+    for attempt in 1..=10u32 {
+        let bind_result = (|| -> std::io::Result<tokio::net::TcpListener> {
+            let socket = tokio::net::TcpSocket::new_v4()?;
+            // SO_REUSEADDR apenas em Unix: no Windows ele permite que dois
+            // processos façam bind na mesma porta simultaneamente (port hijack).
+            #[cfg(not(target_os = "windows"))]
+            let _ = socket.set_reuseaddr(true);
+            socket.bind(addr)?;
+            socket.listen(1024)
+        })();
+
+        match bind_result {
+            Ok(l) => {
+                listener = Some(l);
+                break;
+            }
+            Err(e) => {
+                logger::warn(&format!(
+                    "Tentativa {}/10 de abrir a porta {} falhou: {}",
+                    attempt, SERVER_PORT, e
+                ));
+                last_err = Some(e);
+
+                // Se outra instância do app já estiver atendendo, encerra esta
+                // tentativa sem erro fatal — a outra instância cuida de tudo.
+                if another_instance_is_running().await {
+                    logger::warn(
+                        "Outra instância do aplicativo já está rodando nesta porta. \
+                        Este processo não iniciará um segundo servidor.",
+                    );
+                    return Ok(());
+                }
+
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+        }
+    }
+
+    let listener = match listener {
+        Some(l) => l,
+        None => {
+            return Err(Box::new(last_err.unwrap_or_else(|| {
+                std::io::Error::other("Falha desconhecida ao abrir a porta")
+            })));
+        }
+    };
 
     logger::info(&format!(
         "Servidor HTTP rodando em http://{}:{}",
@@ -127,14 +187,43 @@ pub fn run() {
             // Roda o servidor Axum numa thread dedicada com seu próprio runtime
             // Tokio — mais confiável do que depender do runtime interno do Tauri.
             std::thread::spawn(|| {
-                let rt = tokio::runtime::Builder::new_multi_thread()
+                let rt = match tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
                     .thread_name("axum-server")
                     .build()
-                    .expect("Falha ao criar runtime Tokio para o servidor HTTP");
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        logger::error(&format!(
+                            "Falha ao criar runtime Tokio para o servidor HTTP: {e}"
+                        ));
+                        return;
+                    }
+                };
 
-                if let Err(e) = rt.block_on(start_http_server()) {
-                    eprintln!("[FATAL] Servidor HTTP encerrou com erro: {e}");
+                // Se o servidor cair (erro de bind, pânico interno, etc.),
+                // tenta reiniciá-lo em vez de deixar o app rodando sem backend.
+                loop {
+                    let result = rt.block_on(async {
+                        // Captura pânicos dentro do servidor para não matar a thread.
+                        match tokio::spawn(start_http_server()).await {
+                            Ok(r) => r,
+                            Err(join_err) => Err(format!("Pânico no servidor HTTP: {join_err}").into()),
+                        }
+                    });
+
+                    match result {
+                        Ok(()) => {
+                            // Encerramento limpo (ex.: outra instância já roda). Não reinicia.
+                            break;
+                        }
+                        Err(e) => {
+                            logger::error(&format!(
+                                "Servidor HTTP encerrou com erro: {e}. Reiniciando em 5s..."
+                            ));
+                            std::thread::sleep(std::time::Duration::from_secs(5));
+                        }
+                    }
                 }
             });
 

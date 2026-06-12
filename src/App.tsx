@@ -72,6 +72,13 @@ function App() {
 
   const cfg = STATUS_CONFIG[status.kind] ?? STATUS_CONFIG.standby;
 
+  // Sem conexão com o serviço local: o servidor pode estar reiniciando
+  // (ele tenta se recuperar sozinho). Mostra uma mensagem clara ao usuário.
+  const displayLabel = connected ? cfg.label : "Reconectando";
+  const displayMessage = connected
+    ? status.message
+    : "Conectando ao serviço local... Se persistir, reinicie o aplicativo.";
+
   return (
     <main className="status-root">
       <div className="status-card" style={{ "--accent": cfg.color } as React.CSSProperties}>
@@ -85,9 +92,9 @@ function App() {
 
         <div className="status-text">
           <span className="status-kind" style={{ color: cfg.color }}>
-            {cfg.label}
+            {displayLabel}
           </span>
-          <span className="status-message">{status.message}</span>
+          <span className="status-message">{displayMessage}</span>
         </div>
 
         <div className={`status-dot ${connected ? "dot-on" : "dot-off"}`} title={connected ? "Conectado" : "Sem conexão"} />

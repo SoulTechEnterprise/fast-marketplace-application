@@ -47,8 +47,16 @@ impl ImageRepositoryImpl {
         let base_storage_dir = env::temp_dir().join("webscraping_images");
         let _ = fs::create_dir_all(&base_storage_dir);
 
+        // Timeouts são essenciais: em redes lentas/instáveis, um download sem
+        // timeout fica pendurado para sempre e trava a publicação inteira.
+        let client = Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .unwrap_or_else(|_| Client::new());
+
         Self {
-            client: Client::new(),
+            client,
             base_storage_dir,
         }
     }
@@ -160,29 +168,36 @@ impl ImageRepository for ImageRepositoryImpl {
                     let bytes = response.bytes().await.ok()?;
                     let raw_size = bytes.len();
 
-                    // Carregar imagem na memória
-                    let img = image::load_from_memory(&bytes).ok()?;
+                    // Proteção contra estouro de memória em máquinas fracas:
+                    // arquivos absurdamente grandes são descartados antes do decode.
+                    const MAX_DOWNLOAD_BYTES: usize = 60 * 1024 * 1024;
+                    if raw_size > MAX_DOWNLOAD_BYTES {
+                        logger::warn(&format!(
+                            "Imagem ignorada ({:.1} MB excede o limite de download): {}",
+                            logger::bytes_to_mb(raw_size),
+                            url
+                        ));
+                        return None;
+                    }
 
-                    // Decidir: manter, converter ou otimizar
-                    let jpg_bytes = if raw_size > MAX_SIZE_BYTES {
-                        // Imagem excede 10 MB — otimizar progressivamente
-                        tokio::task::spawn_blocking(move || optimize_image(&img, raw_size))
-                            .await
-                            .ok()?
-                    } else {
-                        // Imagem dentro do limite — apenas converter para JPEG
-                        let size_mb = logger::bytes_to_mb(raw_size);
-                        let result = tokio::task::spawn_blocking(move || {
+                    // Decode + encode são pesados em CPU: rodar em spawn_blocking
+                    // para não congelar o runtime async (e a UI) em PCs lentos.
+                    let jpg_bytes = tokio::task::spawn_blocking(move || {
+                        let img = image::load_from_memory(&bytes).ok()?;
+
+                        if raw_size > MAX_SIZE_BYTES {
+                            // Imagem excede 10 MB — otimizar progressivamente
+                            Some(optimize_image(&img, raw_size))
+                        } else {
+                            // Imagem dentro do limite — apenas converter para JPEG
                             let mut buf = Cursor::new(Vec::new());
                             img.write_to(&mut buf, ImageFormat::Jpeg).ok()?;
+                            logger::image_kept(logger::bytes_to_mb(raw_size));
                             Some(buf.into_inner())
-                        })
-                        .await
-                        .ok()??;
-
-                        logger::image_kept(size_mb);
-                        result
-                    };
+                        }
+                    })
+                    .await
+                    .ok()??;
 
                     let filename = format!("{}.jpg", Uuid::new_v4());
                     let local_path = storage_dir.join(&filename);

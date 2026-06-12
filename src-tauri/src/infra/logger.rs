@@ -12,6 +12,53 @@ const MAGENTA: &str = "\x1b[35m";
 const WHITE: &str = "\x1b[97m";
 const BLUE: &str = "\x1b[34m";
 
+// ─── Log em arquivo (para depurar na máquina do cliente) ─────────────────────
+
+/// Caminho do arquivo de log: %LOCALAPPDATA%/marketplace/logs/app.log no Windows
+/// (ou ~/.local/share|Library nos demais sistemas).
+fn log_file_path() -> std::path::PathBuf {
+    #[cfg(target_os = "windows")]
+    let base = dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    #[cfg(not(target_os = "windows"))]
+    let base = dirs::data_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+
+    let dir = base.join("marketplace").join("logs");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("app.log")
+}
+
+/// Tamanho máximo do arquivo de log antes da rotação (5 MB).
+/// Sem isso, o app.log cresce indefinidamente e pode encher o disco
+/// do cliente ao longo de meses de uso.
+const MAX_LOG_SIZE_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Rotaciona o log se exceder o tamanho máximo: app.log → app.log.old
+/// (sobrescrevendo o .old anterior). Mantém no máximo ~10 MB em disco.
+fn rotate_log_if_needed(path: &std::path::Path) {
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > MAX_LOG_SIZE_BYTES {
+            let old = path.with_extension("log.old");
+            let _ = std::fs::remove_file(&old);
+            let _ = std::fs::rename(path, &old);
+        }
+    }
+}
+
+/// Grava uma linha de log (sem cores ANSI) no arquivo, em modo append.
+/// Falhas de escrita são ignoradas para nunca derrubar a aplicação.
+fn log_to_file(level: &str, msg: &str) {
+    use std::io::Write;
+    let path = log_file_path();
+    rotate_log_if_needed(&path);
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{} [{}] {}", timestamp(), level, msg);
+    }
+}
+
 // ─── Timestamp formatado ────────────────────────────────────────────────────
 
 fn timestamp() -> String {
@@ -45,6 +92,7 @@ pub fn info(msg: &str) {
         timestamp(),
         msg
     );
+    log_to_file("INFO", msg);
 }
 
 /// Exibe mensagem de aviso com ícone amarelo e timestamp.
@@ -54,6 +102,7 @@ pub fn warn(msg: &str) {
         timestamp(),
         msg
     );
+    log_to_file("WARN", msg);
 }
 
 /// Exibe mensagem de erro com ícone vermelho e timestamp.
@@ -63,6 +112,7 @@ pub fn error(msg: &str) {
         timestamp(),
         msg
     );
+    log_to_file("ERRO", msg);
 }
 
 /// Exibe progresso de otimização de imagem.
