@@ -61,3 +61,22 @@ jobs:
           prerelease: false
           # Gera os dois instaladores de Windows (NSIS .exe e MSI).
           args: --target x86_64-pc-windows-msvc
+
+      - name: Renomear instaladores (sem versão) e enviar ao release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ github.ref_type == 'tag' && github.ref_name || github.event.inputs.tag }}"
+          $bundle = "src-tauri/target/x86_64-pc-windows-msvc/release/bundle"
+
+          $exe = Get-ChildItem "$bundle/nsis/*-setup.exe" | Select-Object -First 1
+          $msi = Get-ChildItem "$bundle/msi/*.msi" | Select-Object -First 1
+
+          Copy-Item $exe.FullName "fast-marketplace_x64-setup.exe"
+          Copy-Item $msi.FullName "fast-marketplace_x64.msi"
+
+          gh release upload $tag `
+            "fast-marketplace_x64-setup.exe" `
+            "fast-marketplace_x64.msi" `
+            --clobber
