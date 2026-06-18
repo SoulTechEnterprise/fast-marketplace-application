@@ -398,6 +398,7 @@ pub trait PageExt {
     async fn click_option(&self, text: &str) -> Result<(), DomainError>;
     async fn focus_and_type(&self, xpath: &str, value: &str) -> Result<(), DomainError>;
     async fn select_dropdown(&self, xpath: &str, option_text: &str) -> Result<(), DomainError>;
+    async fn upload_files(&self, selector: &str, files: Vec<String>) -> Result<(), DomainError>;
 }
 
 #[async_trait]
@@ -544,6 +545,82 @@ impl PageExt for Page {
         sleep(Duration::from_secs(1)).await;
         self.click_option(option_text).await?;
         Ok(())
+    }
+
+    /// Envia arquivos para um `<input type="file">` de forma robusta.
+    ///
+    /// O Facebook é uma SPA em React que re-renderiza o input de fotos com
+    /// frequência. Quando isso acontece, o `nodeId` capturado anteriormente
+    /// fica obsoleto e o `DOM.setFileInputFiles` falha com
+    /// `-32602: Invalid parameters` ("Could not find node with given id").
+    ///
+    /// Para evitar isso:
+    ///   1. Reencontramos o elemento a cada tentativa (nó sempre atual).
+    ///   2. Usamos `backend_node_id` em vez de `node_id` — o backend node id
+    ///      é estável e sobrevive aos re-renders do React.
+    ///   3. Repetimos algumas vezes em caso de falha transitória.
+    async fn upload_files(&self, selector: &str, files: Vec<String>) -> Result<(), DomainError> {
+        // Garante que só enviamos caminhos que realmente existem no disco —
+        // um caminho inexistente também provoca erro no Chromium.
+        let valid_files: Vec<String> = files
+            .into_iter()
+            .filter(|p| std::path::Path::new(p).exists())
+            .collect();
+
+        if valid_files.is_empty() {
+            return Err(DomainError::AutomationError(
+                "Nenhuma foto válida foi encontrada para enviar (os arquivos podem ter falhado no download/otimização).".to_string(),
+            ));
+        }
+
+        let mut last_error = String::from("desconhecido");
+
+        for attempt in 1..=5 {
+            // Reencontra o input a cada tentativa para obter um nó atual.
+            let el = match self.find_element(selector).await {
+                Ok(el) => el,
+                Err(e) => {
+                    last_error = e.to_string();
+                    sleep(Duration::from_millis(800)).await;
+                    continue;
+                }
+            };
+
+            let result = self
+                .execute(SetFileInputFilesParams {
+                    files: valid_files.clone(),
+                    // Preferimos backend_node_id (estável) a node_id (volátil).
+                    node_id: None,
+                    backend_node_id: Some(el.backend_node_id),
+                    object_id: None,
+                })
+                .await;
+
+            match result {
+                Ok(_) => {
+                    if attempt > 1 {
+                        logger::info(&format!(
+                            "Fotos enviadas ao Chromium na tentativa {}.",
+                            attempt
+                        ));
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    last_error = e.to_string();
+                    logger::warn(&format!(
+                        "Falha ao enviar fotos (tentativa {}/5): {} — tentando novamente...",
+                        attempt, last_error
+                    ));
+                    sleep(Duration::from_millis(800)).await;
+                }
+            }
+        }
+
+        Err(DomainError::AutomationError(format!(
+            "Falha ao enviar as fotos para o Chromium: {}",
+            last_error
+        )))
     }
 }
 
@@ -958,19 +1035,11 @@ impl WebscrapingMarketplaceService for FacebookMarketplaceService {
             ));
         }
 
-        let el = page.wait_for_element(SEL_PHOTO_INPUT).await?;
+        // Garante que o input de fotos exista antes de tentar o upload.
+        page.wait_for_element(SEL_PHOTO_INPUT).await?;
         let image_paths: Vec<String> = entity.image().iter().map(|s| s.to_string()).collect();
 
-        page.execute(SetFileInputFilesParams {
-            files: image_paths,
-            node_id: Some(el.node_id),
-            backend_node_id: None,
-            object_id: None,
-        })
-        .await
-        .map_err(|e| {
-            DomainError::AutomationError(format!("Falha ao enviar as fotos para o Chromium: {}", e))
-        })?;
+        page.upload_files(SEL_PHOTO_INPUT, image_paths).await?;
 
         logger::info("Fotos enviadas, aguardando formulário carregar...");
         sleep(Duration::from_secs(5)).await;
@@ -1082,19 +1151,11 @@ impl WebscrapingMarketplaceService for FacebookMarketplaceService {
             ));
         }
 
-        let el = page.wait_for_element(SEL_PHOTO_INPUT).await?;
+        // Garante que o input de fotos exista antes de tentar o upload.
+        page.wait_for_element(SEL_PHOTO_INPUT).await?;
         let image_paths: Vec<String> = entity.image().iter().map(|s| s.to_string()).collect();
 
-        page.execute(SetFileInputFilesParams {
-            files: image_paths,
-            node_id: Some(el.node_id),
-            backend_node_id: None,
-            object_id: None,
-        })
-        .await
-        .map_err(|e| {
-            DomainError::AutomationError(format!("Falha ao enviar as fotos para o Chromium: {}", e))
-        })?;
+        page.upload_files(SEL_PHOTO_INPUT, image_paths).await?;
 
         logger::info("Fotos enviadas, aguardando formulário carregar...");
         sleep(Duration::from_secs(5)).await;

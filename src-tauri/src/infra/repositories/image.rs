@@ -20,8 +20,28 @@ const MAX_SIZE_BYTES: usize = 10 * 1024 * 1024;
 /// Número máximo de imagens por requisição.
 const MAX_IMAGES_PER_REQUEST: usize = 50;
 
-/// Número máximo de downloads simultâneos.
-const MAX_CONCURRENT_DOWNLOADS: usize = 5;
+/// Piso de downloads/otimizações simultâneos (PCs muito fracos / 1 núcleo).
+const MIN_CONCURRENT_DOWNLOADS: usize = 2;
+
+/// Teto de downloads/otimizações simultâneos. Acima disso não compensa:
+/// muitos downloads paralelos do mesmo servidor sofrem throttling e o ganho
+/// de CPU satura. PCs fortes já atingem o máximo de proveito aqui.
+const MAX_CONCURRENT_DOWNLOADS_CAP: usize = 8;
+
+/// Calcula quantos downloads/otimizações rodar em paralelo de acordo com a
+/// capacidade da máquina. Quanto melhor o PC (mais núcleos de CPU), mais
+/// trabalho simultâneo; quanto mais fraco, menos — evitando travar o
+/// computador do usuário.
+///
+/// O processamento de imagem (decode + encode JPEG) é pesado em CPU, então
+/// usamos o número de núcleos lógicos disponíveis como medida da capacidade.
+fn recommended_concurrency() -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(MIN_CONCURRENT_DOWNLOADS);
+
+    cores.clamp(MIN_CONCURRENT_DOWNLOADS, MAX_CONCURRENT_DOWNLOADS_CAP)
+}
 
 /// Qualidade JPEG inicial para compressão.
 const JPEG_QUALITY_START: u8 = 90;
@@ -40,6 +60,9 @@ const RESIZE_SCALES: [u32; 3] = [80, 60, 50];
 pub struct ImageRepositoryImpl {
     client: Client,
     base_storage_dir: PathBuf,
+    /// Número de downloads/otimizações simultâneos, calculado a partir da
+    /// capacidade da máquina no momento da inicialização.
+    concurrency: usize,
 }
 
 impl ImageRepositoryImpl {
@@ -55,9 +78,16 @@ impl ImageRepositoryImpl {
             .build()
             .unwrap_or_else(|_| Client::new());
 
+        let concurrency = recommended_concurrency();
+        logger::info(&format!(
+            "Concorrência de imagens ajustada para {} (baseado na capacidade do computador).",
+            concurrency
+        ));
+
         Self {
             client,
             base_storage_dir,
+            concurrency,
         }
     }
 
@@ -143,7 +173,7 @@ fn optimize_image(img: &DynamicImage, original_size: usize) -> Vec<u8> {
 #[async_trait]
 impl ImageRepository for ImageRepositoryImpl {
     async fn add(&self, urls: Vec<String>) -> Vec<String> {
-        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DOWNLOADS));
+        let semaphore = Arc::new(Semaphore::new(self.concurrency));
 
         // Limita número de imagens para prevenir abuso
         let urls: Vec<String> = urls.into_iter().take(MAX_IMAGES_PER_REQUEST).collect();
