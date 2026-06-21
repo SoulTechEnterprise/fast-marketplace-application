@@ -772,8 +772,17 @@ impl FacebookMarketplaceService {
         let chrome_path = find_chrome_executable().await;
 
         let extra_flags: Vec<&str> = vec![
+            // Abre a janela maximizada no tamanho REAL da tela do cliente.
+            // (Removido o `--window-size=1280,720` fixo, que conflitava com este
+            // e travava a janela num tamanho que não cabia em telas menores.)
             "--start-maximized",
-            "--window-size=1280,720",
+            // Em computadores com escala de tela do Windows diferente de 100%
+            // (125%, 150% — comum em notebooks/telas HiDPI), o Chrome herda esse
+            // zoom do sistema operacional e o Facebook fica gigante, escondendo o
+            // botão de publicar. Forçar o device scale factor para 1 garante que a
+            // página renderize sempre no tamanho normal, independente da escala do SO.
+            "--force-device-scale-factor=1",
+            "--high-dpi-support=1",
             "--disable-infobars",
             "--disable-notifications",
             "--disable-blink-features=AutomationControlled",
@@ -804,14 +813,14 @@ impl FacebookMarketplaceService {
             let mut builder = BrowserConfig::builder()
                 .with_head()
                 .user_data_dir(profile_dir(client_id))
-                .viewport(chromiumoxide::handler::viewport::Viewport {
-                    width: 1280,
-                    height: 720,
-                    device_scale_factor: Some(1.0),
-                    emulating_mobile: false,
-                    is_landscape: true,
-                    has_touch: false,
-                });
+                // Sem override de viewport: passando `None`, o chromiumoxide NÃO
+                // envia `Emulation.setDeviceMetricsOverride`, então a área de
+                // renderização acompanha o tamanho real da janela (que abre
+                // maximizada via `--start-maximized`). Assim a página se adapta à
+                // resolução de cada cliente, em vez de ficar travada em 1280x720.
+                // O fator de escala continua fixado em 1 pela flag
+                // `--force-device-scale-factor=1` (nível de processo, mais confiável).
+                .viewport(None::<chromiumoxide::handler::viewport::Viewport>);
 
             if let Some(ref path) = chrome_path {
                 builder = builder.chrome_executable(path.clone());
