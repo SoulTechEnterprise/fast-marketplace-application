@@ -34,3 +34,4 @@ dirs = "5"
 axum = "0.7"
 tower-http = { version = "0.5", features = ["cors"] }
 image = "0.25"
+base64 = "0.22"

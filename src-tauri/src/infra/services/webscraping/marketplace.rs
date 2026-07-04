@@ -952,6 +952,17 @@ impl FacebookMarketplaceService {
 
         Ok(page)
     }
+
+    /// Conta quantos botões "Renovar" estão presentes no painel atual.
+    async fn count_renew_buttons(page: &Page) -> i64 {
+        page.evaluate(
+            r#"document.querySelectorAll('div[role="button"][aria-label="Renovar"]').length"#,
+        )
+        .await
+        .ok()
+        .and_then(|v| v.into_value::<i64>().ok())
+        .unwrap_or(0)
+    }
 }
 
 impl Default for FacebookMarketplaceService {
@@ -1383,5 +1394,147 @@ impl WebscrapingMarketplaceService for FacebookMarketplaceService {
 
         guard.close().await;
         Ok(is_logged_in)
+    }
+
+    async fn renew_listings(&self, client_id: String) -> Result<u32, DomainError> {
+        sanitize_client_id(&client_id)?;
+        let _op = self.acquire_operation_lock()?;
+
+        const RENEW_URL: &str =
+            "https://www.facebook.com/marketplace/selling/renew_listings/?is_routable_dialog=true";
+
+        // Clica em ATÉ 5 botões "Renovar" ainda não clicados por chamada (marca os
+        // já clicados com um atributo pra não repetir). O ritmo humano — 5 por vez,
+        // com pausa entre os lotes — é controlado pelo laço em Rust.
+        const JS_CLICK_BATCH: &str = r#"
+            (function() {
+                var btns = document.querySelectorAll('div[role="button"][aria-label="Renovar"]:not([data-renew-clicked])');
+                var n = 0;
+                for (var i = 0; i < btns.length && n < 5; i++) {
+                    try {
+                        btns[i].setAttribute('data-renew-clicked', '1');
+                        btns[i].click();
+                        n++;
+                    } catch (e) {}
+                }
+                return n;
+            })()
+        "#;
+
+        // Headless: a automação roda em segundo plano, sem abrir janela.
+        let browser = Self::launch_browser_headless(client_id.as_str()).await?;
+        let guard = BrowserGuard::new(browser);
+        let page = Self::get_or_create_page(
+            guard.browser.as_ref().ok_or(DomainError::AutomationError(
+                "Browser não disponível".to_string(),
+            ))?,
+            RENEW_URL,
+        )
+        .await?;
+
+        // Força pt-BR e aplica o script anti-detecção (mesmo padrão das demais).
+        page.evaluate(
+            r#"document.cookie = "locale=pt_BR; domain=.facebook.com; path=/; max-age=31536000; SameSite=None; Secure";"#,
+        )
+        .await
+        .ok();
+        page.evaluate("window.location.reload()").await.ok();
+        sleep(Duration::from_secs(4)).await;
+        page.evaluate(ANTI_DETECTION_JS).await.ok();
+        sleep(Duration::from_secs(2)).await;
+
+        // Precisa estar logado no Facebook.
+        let current_url = page
+            .evaluate("window.location.href")
+            .await
+            .ok()
+            .and_then(|v| v.into_value::<String>().ok())
+            .unwrap_or_default();
+
+        if current_url.contains("login") || current_url.contains("checkpoint") {
+            logger::error(&format!(
+                "Usuário não está logado no Facebook. URL atual: {}",
+                current_url
+            ));
+            guard.close().await;
+            return Err(DomainError::AutomationError(
+                "Você precisa estar logado no Facebook antes de renovar. Use a opção 'Conectar Facebook' primeiro."
+                    .to_string(),
+            ));
+        }
+
+        let mut total_renewed: u32 = 0;
+        let mut last_remaining: i64 = -1;
+
+        // Cada rodada: espera o painel, clica em todos os "Renovar", recarrega e
+        // reconta. Termina quando não sobra nenhum (ou se travar sem progresso).
+        for round in 1..=25 {
+            // Espera o painel carregar (até ~12s). Se nada aparecer, terminou.
+            let mut remaining = 0i64;
+            for _ in 0..16 {
+                remaining = Self::count_renew_buttons(&page).await;
+                if remaining > 0 {
+                    break;
+                }
+                sleep(Duration::from_millis(750)).await;
+            }
+
+            if remaining == 0 {
+                break;
+            }
+
+            // Trava de segurança: se o total não caiu desde a rodada anterior,
+            // os botões não estão sumindo — para para não clicar em loop.
+            if remaining == last_remaining {
+                logger::warn(
+                    "Renovação sem progresso (os anúncios não sumiram). Encerrando o loop.",
+                );
+                break;
+            }
+            last_remaining = remaining;
+
+            // Clica em lotes de até 5, com pausa de 2s entre eles (ritmo humano),
+            // até não sobrar nenhum botão não clicado nesta página.
+            let mut clicked_this_round: u32 = 0;
+            for _ in 0..60 {
+                let batch = page
+                    .evaluate(JS_CLICK_BATCH)
+                    .await
+                    .ok()
+                    .and_then(|v| v.into_value::<i64>().ok())
+                    .unwrap_or(0);
+
+                if batch <= 0 {
+                    break;
+                }
+
+                clicked_this_round = clicked_this_round.saturating_add(batch as u32);
+                sleep(Duration::from_secs(2)).await;
+            }
+
+            if clicked_this_round == 0 {
+                break;
+            }
+
+            total_renewed = total_renewed.saturating_add(clicked_this_round);
+            logger::info(&format!(
+                "Rodada {}: {} anúncio(s) renovado(s).",
+                round, clicked_this_round
+            ));
+
+            // Deixa o Facebook processar as renovações e recarrega o painel.
+            sleep(Duration::from_secs(3)).await;
+            let _ = page.goto(RENEW_URL).await;
+            sleep(Duration::from_secs(3)).await;
+        }
+
+        guard.close().await;
+
+        logger::info(&format!(
+            "Renovação concluída. Total renovado: {}.",
+            total_renewed
+        ));
+
+        Ok(total_renewed)
     }
 }

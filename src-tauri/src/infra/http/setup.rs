@@ -3,7 +3,8 @@ use std::sync::Arc;
 use crate::{
     application::usecases::{
         add_property::AddPropertyUseCase, add_vehicle::AddVehicleUseCase,
-        get_marketplace::GetMarketplaceUseCase, signin_marketplace::SignInMarketplaceUseCase,
+        get_marketplace::GetMarketplaceUseCase, renew_listings::RenewListingsUseCase,
+        signin_marketplace::SignInMarketplaceUseCase,
         signout_marketplace::SignOutMarketplaceUseCase,
     },
     infra::{
@@ -21,4 +22,5 @@ pub struct AppState {
     pub get_marketplace_usecase: Arc<GetMarketplaceUseCase<FacebookMarketplaceService>>,
     pub signin_marketplace_usecase: Arc<SignInMarketplaceUseCase<FacebookMarketplaceService>>,
     pub signout_marketplace_usecase: Arc<SignOutMarketplaceUseCase<FacebookMarketplaceService>>,
+    pub renew_listings_usecase: Arc<RenewListingsUseCase<FacebookMarketplaceService>>,
 }

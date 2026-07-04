@@ -14,7 +14,8 @@ use tower_http::cors::CorsLayer;
 use crate::{
     application::usecases::{
         add_property::AddPropertyUseCase, add_vehicle::AddVehicleUseCase,
-        get_marketplace::GetMarketplaceUseCase, signin_marketplace::SignInMarketplaceUseCase,
+        get_marketplace::GetMarketplaceUseCase, renew_listings::RenewListingsUseCase,
+        signin_marketplace::SignInMarketplaceUseCase,
         signout_marketplace::SignOutMarketplaceUseCase,
     },
     infra::{
@@ -75,6 +76,8 @@ async fn start_http_server() -> Result<(), Box<dyn std::error::Error + Send + Sy
     ));
     let signin_usecase = Arc::new(SignInMarketplaceUseCase::new(webscraping_service.clone()));
     let signout_usecase = Arc::new(SignOutMarketplaceUseCase::new(webscraping_service.clone()));
+    let renew_listings_usecase =
+        Arc::new(RenewListingsUseCase::new(webscraping_service.clone()));
     let get_marketplace_usecase = Arc::new(GetMarketplaceUseCase::new(webscraping_service));
 
     let status = StatusHandle::new();
@@ -86,6 +89,7 @@ async fn start_http_server() -> Result<(), Box<dyn std::error::Error + Send + Sy
         signin_marketplace_usecase: signin_usecase,
         signout_marketplace_usecase: signout_usecase,
         get_marketplace_usecase,
+        renew_listings_usecase,
     });
 
     // ── Configurar CORS ─────────────────────────────────────────────────

@@ -55,4 +55,8 @@ impl WebscrapingMarketplaceService for InMemoryWebscrapingMarketplaceService {
         let is_signed_in = self.sessions.lock().unwrap().contains(&client_id);
         Ok(is_signed_in)
     }
+
+    async fn renew_listings(&self, _client_id: String) -> Result<u32, DomainError> {
+        Ok(0)
+    }
 }

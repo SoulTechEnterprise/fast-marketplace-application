@@ -9,3 +9,8 @@ pub struct MarketplaceUseCaseRequest {
 pub struct MarketplaceUseCaseResponse {
     pub status: bool,
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RenewListingsUseCaseResponse {
+    pub renewed: u32,
+}

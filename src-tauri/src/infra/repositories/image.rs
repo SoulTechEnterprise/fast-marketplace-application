@@ -1,5 +1,6 @@
 use std::{env, fs, path::PathBuf, sync::Arc};
 
+use base64::Engine;
 use reqwest::Client;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
@@ -11,6 +12,20 @@ use std::io::Cursor;
 
 use crate::domain::repositories::image::ImageRepository;
 use crate::infra::logger;
+
+/// Extrai o payload base64 de um data URI (ex.: "data:image/jpeg;base64,AAAA").
+/// Imagens tratadas pelo DeWatermark chegam nesse formato (em vez de uma URL).
+/// Retorna `None` quando não é um data URI base64 — aí a entrada é tratada como URL.
+fn data_uri_payload(s: &str) -> Option<&str> {
+    if !s.starts_with("data:") {
+        return None;
+    }
+    let comma = s.find(',')?;
+    if !s[..comma].contains("base64") {
+        return None;
+    }
+    Some(&s[comma + 1..])
+}
 
 // ─── Constantes de configuração ─────────────────────────────────────────────
 
@@ -194,8 +209,25 @@ impl ImageRepository for ImageRepositoryImpl {
 
                 tokio::spawn(async move {
                     let _permit = sem.acquire().await.ok()?;
-                    let response = client.get(&url).send().await.ok()?;
-                    let bytes = response.bytes().await.ok()?;
+
+                    // Duas origens possíveis para a imagem:
+                    //   1. data URI base64 (imagem já tratada pelo DeWatermark) → decodifica direto;
+                    //   2. URL normal (imagem original do anúncio) → baixa via HTTP GET.
+                    let bytes: Vec<u8> = if let Some(b64) = data_uri_payload(&url) {
+                        match base64::engine::general_purpose::STANDARD.decode(b64) {
+                            Ok(decoded) => decoded,
+                            Err(e) => {
+                                logger::warn(&format!(
+                                    "Falha ao decodificar imagem base64: {}",
+                                    e
+                                ));
+                                return None;
+                            }
+                        }
+                    } else {
+                        let response = client.get(&url).send().await.ok()?;
+                        response.bytes().await.ok()?.to_vec()
+                    };
                     let raw_size = bytes.len();
 
                     // Proteção contra estouro de memória em máquinas fracas:
